@@ -1,49 +1,67 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 import os
 
 app = FastAPI()
 
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")  # Set this in Railway → Variables
+
 
 class Question(BaseModel):
     text: str
 
+
+@app.get("/")
+async def health():
+    return {"status": "QuizBot backend running"}
+
+
 @app.post("/answer")
 async def answer(q: Question):
+    if not q.text.strip():
+        raise HTTPException(status_code=400, detail="Empty question")
 
-    prompt = f"""
-You are a quiz solver.
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="API_KEY not set")
 
-Return ONLY one letter:
-A, B, C, or D.
+    prompt = f"""You are a quiz solver.
 
-No explanation.
+Return ONLY one letter: A, B, C, or D.
+No explanation. No punctuation. Just the letter.
 
 Question:
 {q.text}
 """
 
-    async with httpx.AsyncClient(timeout=5) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "google/gemini-2.5-flash",
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0,
-                "max_tokens": 2
-            }
-        )
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "google/gemini-2.5-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": 2,
+                },
+            )
+            r.raise_for_status()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="OpenRouter timeout")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"OpenRouter error: {e.response.status_code}")
 
     data = r.json()
 
-    return {
-        "answer": data["choices"][0]["message"]["content"].strip()
-    }
+    try:
+        raw = data["choices"][0]["message"]["content"].strip().upper()
+        # Sanitise — only accept A/B/C/D
+        letter = raw[0] if raw and raw[0] in "ABCD" else "?"
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Unexpected OpenRouter response")
+
+    return {"answer": letter}
