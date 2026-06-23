@@ -25,12 +25,19 @@ async def answer(q: Question):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API_KEY not set")
 
-    prompt = f"""You are a quiz solver.
+    prompt = f"""You are a football quiz solver. Below is raw OCR text captured from a
+quiz screen. It contains a question followed by multiple-choice options
+(they may be labelled A/B/C/D, or just listed as separate lines/numbers,
+or run together — OCR is imperfect, so infer the structure yourself).
 
-Return ONLY one letter: A, B, C, or D.
-No explanation. No punctuation. Just the letter.
+Read the OCR text, figure out the question and the options, and pick the
+correct option.
 
-Question:
+Respond with ONLY the single letter A, B, C, or D corresponding to the
+correct option's position (1st option = A, 2nd = B, 3rd = C, 4th = D).
+No explanation. No punctuation. No words. Just the one letter.
+
+OCR TEXT:
 {q.text}
 """
 
@@ -46,7 +53,7 @@ Question:
                     "model": "google/gemini-2.5-flash",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 2,
+                    "max_tokens": 10,
                 },
             )
             r.raise_for_status()
@@ -59,8 +66,9 @@ Question:
 
     try:
         raw = data["choices"][0]["message"]["content"].strip().upper()
-        # Sanitise — only accept A/B/C/D
-        letter = raw[0] if raw and raw[0] in "ABCD" else "?"
+        # Sanitise — scan for the first A/B/C/D character anywhere in the
+        # response, since the model may prepend whitespace/punctuation
+        letter = next((ch for ch in raw if ch in "ABCD"), "?")
     except (KeyError, IndexError):
         raise HTTPException(status_code=502, detail="Unexpected OpenRouter response")
 
