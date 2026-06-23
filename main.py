@@ -18,18 +18,14 @@ def clean_ocr_text(raw: str) -> str:
     cleaned = []
     for line in lines:
         line = line.strip()
-        # Skip blank lines
         if not line:
             continue
-        # Skip lines that are mostly non-alphanumeric (OCR noise like "oooeeeee...")
         alnum_ratio = sum(c.isalnum() or c.isspace() for c in line) / len(line)
         if alnum_ratio < 0.5:
             continue
-        # Skip UI chrome lines (short lines that look like buttons/timestamps)
         if line.lower() in {"reply with your answer", "ask another",
                             "+ reply to chatgpt", "n90", "send"}:
             continue
-        # Skip timestamps like "6:29" or "18:30"
         if re.fullmatch(r'\d{1,2}:\d{2}', line):
             continue
         cleaned.append(line)
@@ -51,12 +47,18 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
 
-    prompt = f"""You are a quiz solver. Read the question and options below carefully.
-Return ONLY one letter: A, B, C, or D.
-No explanation. No punctuation. Just the single letter.
+    prompt = """You are a quiz solver. Read the question and answer options below carefully.
+Identify the single correct answer and respond with ONLY the answer text itself.
+Do NOT include the option letter (A/B/C/D). Do NOT include any explanation.
+Keep it short - just the answer words, nothing else.
 
-{cleaned}
-"""
+Example:
+Question: What is the capital of France?
+A) London  B) Berlin  C) Paris  D) Rome
+Your response: Paris
+
+Now answer this:
+""" + cleaned
 
     try:
         async with httpx.AsyncClient(timeout=6) as client:
@@ -70,7 +72,7 @@ No explanation. No punctuation. Just the single letter.
                     "model": "google/gemini-2.5-flash",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 5,
+                    "max_tokens": 30,
                 },
             )
             r.raise_for_status()
@@ -82,11 +84,12 @@ No explanation. No punctuation. Just the single letter.
     data = r.json()
 
     try:
-        raw = data["choices"][0]["message"]["content"].strip().upper()
-        # Extract first valid letter found anywhere in response
-        match = re.search(r'[ABCD]', raw)
-        letter = match.group(0) if match else "?"
+        answer_text = data["choices"][0]["message"]["content"].strip()
+        # Strip any leading letter the model still emits e.g. "C) Paris" -> "Paris"
+        answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]\s*', '', answer_text).strip()
+        if not answer_text:
+            answer_text = "?"
     except (KeyError, IndexError):
         raise HTTPException(status_code=502, detail="Unexpected OpenRouter response")
 
-    return {"answer": letter}
+    return {"answer": answer_text}
