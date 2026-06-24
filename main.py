@@ -52,18 +52,20 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
 
-    prompt = """You are a precise quiz answer bot with strong general knowledge.
-Read the question and ALL options very carefully before answering.
-Think step by step about which option is factually correct.
-Then reply with ONLY the exact text of the correct answer option — copied exactly from the options.
-No letter prefix (no A/B/C/D), no explanation, just the answer words.
+    system_prompt = (
+        "You are a quiz answer bot. "
+        "Output only the correct answer option text — nothing else. "
+        "No letter prefix (A/B/C/D), no explanation. "
+        "Just the exact words of the correct option as written."
+    )
 
-Important: For sports, geography, and current events questions — trust the most recent known facts.
+    user_prompt = (
+        "Read the question and options carefully. "
+        "Reply with ONLY the text of the correct option, no letter prefix.\n\n"
+        + cleaned
+    )
 
-Question and options:
-""" + cleaned
-
-    # gemini-2.5-flash first (fast + accurate), lite as fallback only
+    # Primary: accurate model. Fallback: lite (for when primary times out)
     models = [
         "google/gemini-2.5-flash",
         "google/gemini-2.0-flash-lite",
@@ -72,7 +74,7 @@ Question and options:
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=4) as client:  # reduced from 5s
+            async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -81,9 +83,12 @@ Question and options:
                     },
                     json={
                         "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
                         "temperature": 0,
-                        "max_tokens": 30,   # reduced from 40 — answer is short
+                        "max_tokens": 50,
                         "stream": False,
                     },
                 )
