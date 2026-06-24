@@ -6,7 +6,7 @@ import re
 
 app = FastAPI()
 
-GEMINI_KEY = os.getenv("GEMINI_KEY")
+GEMINI_KEY = os.getenv("API_KEY")   # same Railway variable — no change needed
 SERPER_KEY = os.getenv("SERPER_KEY")
 
 
@@ -111,7 +111,7 @@ async def answer(q: Question):
     if not q.text.strip():
         raise HTTPException(status_code=400, detail="Empty question")
     if not GEMINI_KEY:
-        raise HTTPException(status_code=500, detail="GEMINI_KEY not set")
+        raise HTTPException(status_code=500, detail="API_KEY not set")
 
     cleaned = clean_ocr_text(q.text)
     question_only = extract_question_only(cleaned)
@@ -136,18 +136,20 @@ async def answer(q: Question):
             + cleaned
         )
 
+    # Direct Gemini API — fastest models first, smallest as last fallback
     models = [
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash-latest",
+        "gemini-2.0-flash",       # fastest + smartest — use this most
+        "gemini-2.0-flash-lite",  # slightly cheaper, still fast
+        "gemini-1.5-flash-8b",    # smallest fallback if above fail
     ]
 
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=6) as client:
                 r = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    params={"key": GEMINI_KEY},
                     headers={"Content-Type": "application/json"},
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
@@ -157,7 +159,6 @@ async def answer(q: Question):
                         },
                     },
                 )
-                print(f"[{model}] HTTP {r.status_code}: {r.text[:300]}", flush=True)
                 r.raise_for_status()
                 data = r.json()
                 answer_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -165,8 +166,8 @@ async def answer(q: Question):
 
                 if is_valid_answer(answer_text):
                     return {"answer": answer_text, "model": model}
+
         except Exception as e:
-            print(f"[{model}] Exception: {e}", flush=True)
             last_error = e
             continue
 
