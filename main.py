@@ -52,27 +52,30 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
 
-    prompt = """You are a precise quiz answer bot with strong general knowledge.
-Read the question and ALL options very carefully before answering.
-Think step by step about which option is factually correct.
-Then reply with ONLY the exact text of the correct answer option — copied exactly from the options.
-No letter prefix (no A/B/C/D), no explanation, just the answer words.
+    # System prompt: factual, no reasoning in output — just the answer word(s)
+    system_prompt = (
+        "You are a quiz answer bot. "
+        "Your only job is to output the correct answer option text — nothing else. "
+        "No letter (A/B/C/D), no explanation, no punctuation before the answer. "
+        "Just the exact words of the correct option as written in the question."
+    )
 
-Important: For sports, geography, and current events questions — trust the most recent known facts.
+    # User prompt: structured clearly so the model focuses on factual recall
+    user_prompt = (
+        "Read the question and options below carefully. "
+        "Identify the single factually correct option. "
+        "Reply with ONLY the text of that option — copied exactly, no letter prefix.\n\n"
+        + cleaned
+    )
 
-Question and options:
-""" + cleaned
-
-    # gemini-2.5-flash first (fast + accurate), lite as fallback only
-    models = [
-        "google/gemini-2.5-flash",
-        "google/gemini-2.0-flash-lite",
-    ]
+    # Only use the accurate model — no lite fallback (lite gives wrong answers)
+    # If gemini-2.5-flash fails, retry once before giving up
+    model = "google/gemini-2.5-flash"
 
     last_error = None
-    for model in models:
+    for attempt in range(2):  # 2 attempts on same model, not a weaker fallback
         try:
-            async with httpx.AsyncClient(timeout=4) as client:  # reduced from 5s
+            async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -81,15 +84,19 @@ Question and options:
                     },
                     json={
                         "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
                         "temperature": 0,
-                        "max_tokens": 30,   # reduced from 40 — answer is short
+                        "max_tokens": 50,   # enough for any answer option text
                         "stream": False,
                     },
                 )
                 r.raise_for_status()
                 data = r.json()
                 answer_text = data["choices"][0]["message"]["content"].strip()
+                # Strip any accidental letter prefix the model adds
                 answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
                 if answer_text:
                     return {"answer": answer_text, "model": model}
@@ -97,4 +104,4 @@ Question and options:
             last_error = e
             continue
 
-    raise HTTPException(status_code=502, detail=f"All models failed: {last_error}")
+    raise HTTPException(status_code=502, detail=f"Model failed: {last_error}")
