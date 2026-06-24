@@ -157,6 +157,7 @@ async def answer(q: Question):
                         },
                     },
                 )
+                print(f"[{model}] HTTP {r.status_code}: {r.text[:300]}", flush=True)
                 r.raise_for_status()
                 data = r.json()
                 answer_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -165,6 +166,7 @@ async def answer(q: Question):
                 if is_valid_answer(answer_text):
                     return {"answer": answer_text, "model": model}
         except Exception as e:
+            print(f"[{model}] Exception: {e}", flush=True)
             last_error = e
             continue
 
