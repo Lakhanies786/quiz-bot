@@ -3,241 +3,136 @@ from pydantic import BaseModel
 import httpx
 import os
 import re
-import itertools
 
 app = FastAPI()
 
-# ---------------------------------------------------------------------------
-# API Keys — supports multiple Gemini keys for quota rotation
-# Set GEMINI_KEY_1, GEMINI_KEY_2, GEMINI_KEY_3 in Railway variables
-# At minimum, GEMINI_KEY_1 must be set (your new key goes here)
-# ---------------------------------------------------------------------------
-_raw_keys = [
-    os.getenv("GEMINI_KEY_1"),
-    os.getenv("GEMINI_KEY_2"),
-    os.getenv("GEMINI_KEY_3"),
-]
-GEMINI_KEYS = [k for k in _raw_keys if k]
+# Anthropic API Key
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
-# Fallback: also accept old variable name API_KEY
-if not GEMINI_KEYS:
-    old_key = os.getenv("API_KEY")
-    if old_key:
-        GEMINI_KEYS = [old_key]
-
-_key_cycle = itertools.cycle(GEMINI_KEYS) if GEMINI_KEYS else None
-
-SERPER_KEY = os.getenv("SERPER_KEY")
-
-# ---------------------------------------------------------------------------
-# Working Gemini models as of 2026 (2.0-flash retired March 2026)
-# ---------------------------------------------------------------------------
-MODELS = [
-    "gemini-2.5-flash-lite",  # 1000 RPD free — use first
-    "gemini-2.5-flash",       # 250 RPD free  — fallback
-]
+# Optional: web search (costs $0.01 per search). Set to False to disable.
+ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "false").lower() == "true"
+SERPER_KEY = os.getenv("SERPER_KEY", "")
 
 
 class Question(BaseModel):
     text: str
 
 
-# ---------------------------------------------------------------------------
-# FIX 1: Strip stale overlay/previous-answer lines from OCR text.
-# Lines that appear BEFORE the first option and are very short (≤ 20 chars,
-# no "?" or known question words) are likely leftover answer bubbles from
-# the previous round (e.g. "France", "Geoff Hurst"). Drop them.
-# ---------------------------------------------------------------------------
-_QUESTION_WORDS = re.compile(
-    r'\b(who|what|when|where|which|how|why|did|does|do|is|are|was|were|can|could|would)\b',
-    re.IGNORECASE
-)
-
 def clean_ocr_text(raw: str) -> str:
+    """Strip stale overlay text and junk"""
     lines = raw.splitlines()
     cleaned = []
     found_option = False
+    
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        alnum_ratio = sum(c.isalnum() or c.isspace() for c in line) / len(line)
-        if alnum_ratio < 0.5:
+        
+        # Skip low-quality noise
+        if line.lower() in {"send", "reply with a, b, c, or d", "choose the correct answer", 
+                             "correct!", "incorrect!", "reply with your answer"}:
             continue
-        junk = {
-            "reply with your answer", "ask another", "+ reply to chatgpt",
-            "n90", "send", "reply with a, b, c, or d", "reply with a b c or d",
-            "choose the correct answer", "select one", "pick one",
-            "correct!", "correct", "✅ correct!", "incorrect!", "incorrect",
-        }
-        if line.lower().rstrip("!🏆🎉 ") in junk or line.lower() in junk:
-            continue
-        if line.lower().startswith("reply with"):
-            continue
-        if re.fullmatch(r'\d{1,2}:\d{2}', line):
-            continue
-        # Detect option lines
-        is_option = bool(
-            re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line)
-        )
+        
+        is_option = bool(re.match(r'^[A-D][.)]\s', line))
         if is_option:
             found_option = True
-        # FIX: Before the first option, drop short lines with no question words
-        # — these are stale answer overlays from the previous question
-        if not found_option and not is_option:
-            if len(line) <= 25 and not _QUESTION_WORDS.search(line) and "?" not in line:
-                # Likely a leftover answer bubble (e.g. "France", "Geoff Hurst")
-                continue
+        
+        # Before first option, skip short junk (stale answer bubbles)
+        if not found_option and not is_option and len(line) <= 20 and "?" not in line:
+            continue
+        
         cleaned.append(line)
+    
     return "\n".join(cleaned)
 
 
-def extract_question_only(cleaned: str) -> str:
-    lines = cleaned.splitlines()
-    question_lines = []
-    for line in lines:
-        if re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line):
-            break
-        question_lines.append(line)
-    return " ".join(question_lines).strip()
-
-
-# ---------------------------------------------------------------------------
-# FIX 2: Parse the A/B/C/D option texts so we can validate the answer
-# actually matches one of them.
-# ---------------------------------------------------------------------------
-def extract_options(cleaned: str) -> list[str]:
-    options = []
-    for line in cleaned.splitlines():
-        if re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line):
-            text = re.sub(r'^[\(\[]?[A-D][\)\].]\s*', '', line).strip()
-            if text:
-                options.append(text.lower())
-    return options
-
-
-# ---------------------------------------------------------------------------
-# FIX 3: Validate answer against the actual options list.
-# ---------------------------------------------------------------------------
-def is_valid_answer(text: str, options: list[str] = None) -> bool:
-    if not text:
-        return False
-    low = text.lower()
-    refusals = [
-        "i'm sorry", "i am sorry", "i cannot", "i can't",
-        "as an ai", "unfortunately", "i'm unable",
-        "i need more", "not enough", "i'm not able",
-    ]
-    for r in refusals:
-        if r in low:
-            return False
-    if len(text) > 200:
-        return False
-    # If we parsed options, answer must match one of them (fuzzy: contained-in)
-    if options:
-        if not any(low in opt or opt in low for opt in options):
-            return False
-    return True
-
-
 async def web_search(query: str) -> str:
-    if not SERPER_KEY:
+    """Optional web search. Costs $0.01 per call."""
+    if not ENABLE_WEB_SEARCH or not SERPER_KEY:
         return ""
+    
     try:
-        async with httpx.AsyncClient(timeout=4) as client:
+        async with httpx.AsyncClient(timeout=3) as client:
             r = await client.post(
                 "https://google.serper.dev/search",
-                headers={
-                    "X-API-KEY": SERPER_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={"q": query, "num": 5},
+                headers={"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"},
+                json={"q": query, "num": 3},
             )
             r.raise_for_status()
             data = r.json()
             snippets = []
-            if "answerBox" in data:
-                ab = data["answerBox"]
-                if "answer" in ab:
-                    snippets.append(ab["answer"])
-                elif "snippet" in ab:
-                    snippets.append(ab["snippet"])
-            if "knowledgeGraph" in data:
-                kg = data["knowledgeGraph"]
-                if "description" in kg:
-                    snippets.append(kg["description"])
-            for item in data.get("organic", [])[:3]:
+            
+            if "answerBox" in data and "answer" in data["answerBox"]:
+                snippets.append(data["answerBox"]["answer"])
+            
+            for item in data.get("organic", [])[:2]:
                 if "snippet" in item:
                     snippets.append(item["snippet"])
-            return "\n".join(snippets[:4])
+            
+            return " ".join(snippets[:2])
     except Exception:
         return ""
 
 
 @app.get("/")
 async def health():
-    key_count = len(GEMINI_KEYS)
-    return {"status": "QuizBot backend running", "gemini_keys_loaded": key_count}
+    return {
+        "status": "QuizBot running",
+        "model": ANTHROPIC_MODEL,
+        "web_search_enabled": ENABLE_WEB_SEARCH,
+        "api_key_loaded": bool(ANTHROPIC_API_KEY),
+    }
 
 
 @app.post("/answer")
 async def answer(q: Question):
     if not q.text.strip():
         raise HTTPException(status_code=400, detail="Empty question")
-    if not GEMINI_KEYS:
-        raise HTTPException(status_code=500, detail="No Gemini API key set. Add GEMINI_KEY_1 in Railway variables.")
+    
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="No ANTHROPIC_API_KEY set")
 
     cleaned = clean_ocr_text(q.text)
-    question_only = extract_question_only(cleaned)
-    options = extract_options(cleaned)  # FIX 2: parse options for validation
+    
+    # Get search context only if enabled (costs $0.01)
+    search_context = ""
+    if ENABLE_WEB_SEARCH:
+        first_line = cleaned.split("\n")[0]
+        search_context = await web_search(first_line)
 
-    search_context = await web_search(question_only)
-
+    # Build minimal prompt
     if search_context:
-        prompt = (
-            "You are a quiz answer bot.\n"
-            "Search results to help you:\n"
-            + search_context
-            + "\n\nUsing the search results, pick the correct answer option.\n"
-            "Reply with ONLY the exact text of the correct option — no letter, no explanation.\n\n"
-            "Question and options:\n"
-            + cleaned
-        )
+        prompt = f"Search: {search_context}\n\nPick the correct answer. Reply ONLY the exact option text, no letter.\n\n{cleaned}"
     else:
-        prompt = (
-            "You are a precise quiz answer bot.\n"
-            "Reply with ONLY the exact text of the correct answer option — no letter prefix, no explanation.\n\n"
-            "Question and options:\n"
-            + cleaned
-        )
+        prompt = f"Pick the correct answer from the options. Reply ONLY the exact text of the correct option, no letter or explanation.\n\n{cleaned}"
 
-    last_error = None
-    for model in MODELS:
-        gemini_key = next(_key_cycle)  # rotate through keys each attempt
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    params={"key": gemini_key},
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "temperature": 0,
-                            "maxOutputTokens": 60,
-                        },
-                    },
-                )
-                r.raise_for_status()
-                data = r.json()
-                answer_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 30,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            answer_text = data["content"][0]["text"].strip()
+            
+            # Remove accidental letter prefix if present
+            answer_text = re.sub(r'^[A-D][.)]\s*', '', answer_text).strip()
+            
+            return {"answer": answer_text}
 
-                if is_valid_answer(answer_text, options):  # FIX 3: pass options
-                    return {"answer": answer_text, "model": model}
-
-        except Exception as e:
-            last_error = e
-            continue
-
-    raise HTTPException(status_code=502, detail=f"All models failed: {last_error}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"API error: {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed: {e}")
