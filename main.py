@@ -52,23 +52,21 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
 
-    system_prompt = (
-        "You are a quiz answer bot. "
-        "Output only the correct answer option text — nothing else. "
-        "No letter prefix (A/B/C/D), no explanation. "
-        "Just the exact words of the correct option as written."
-    )
+    prompt = """You are a precise quiz answer bot with strong general knowledge.
+Read the question and ALL options very carefully before answering.
+Think step by step about which option is factually correct.
+Then reply with ONLY the exact text of the correct answer option — copied exactly from the options.
+No letter prefix (no A/B/C/D), no explanation, just the answer words.
 
-    user_prompt = (
-        "Read the question and options carefully. "
-        "Reply with ONLY the text of the correct option, no letter prefix.\n\n"
-        + cleaned
-    )
+Important: For sports, geography, and current events questions — trust the most recent known facts.
 
-    # Primary: accurate model. Fallback: lite (for when primary times out)
+Question and options:
+""" + cleaned
+
     models = [
         "google/gemini-2.5-flash",
         "google/gemini-2.0-flash-lite",
+        "google/gemini-flash-1.5-8b",
     ]
 
     last_error = None
@@ -83,13 +81,9 @@ async def answer(q: Question):
                     },
                     json={
                         "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0,
-                        "max_tokens": 50,
-                        "stream": False,
+                        "max_tokens": 40,
                     },
                 )
                 r.raise_for_status()
