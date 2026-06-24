@@ -42,9 +42,21 @@ class Question(BaseModel):
     text: str
 
 
+# ---------------------------------------------------------------------------
+# FIX 1: Strip stale overlay/previous-answer lines from OCR text.
+# Lines that appear BEFORE the first option and are very short (≤ 20 chars,
+# no "?" or known question words) are likely leftover answer bubbles from
+# the previous round (e.g. "France", "Geoff Hurst"). Drop them.
+# ---------------------------------------------------------------------------
+_QUESTION_WORDS = re.compile(
+    r'\b(who|what|when|where|which|how|why|did|does|do|is|are|was|were|can|could|would)\b',
+    re.IGNORECASE
+)
+
 def clean_ocr_text(raw: str) -> str:
     lines = raw.splitlines()
     cleaned = []
+    found_option = False
     for line in lines:
         line = line.strip()
         if not line:
@@ -55,14 +67,27 @@ def clean_ocr_text(raw: str) -> str:
         junk = {
             "reply with your answer", "ask another", "+ reply to chatgpt",
             "n90", "send", "reply with a, b, c, or d", "reply with a b c or d",
-            "choose the correct answer", "select one", "pick one"
+            "choose the correct answer", "select one", "pick one",
+            "correct!", "correct", "✅ correct!", "incorrect!", "incorrect",
         }
-        if line.lower() in junk:
+        if line.lower().rstrip("!🏆🎉 ") in junk or line.lower() in junk:
             continue
         if line.lower().startswith("reply with"):
             continue
         if re.fullmatch(r'\d{1,2}:\d{2}', line):
             continue
+        # Detect option lines
+        is_option = bool(
+            re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line)
+        )
+        if is_option:
+            found_option = True
+        # FIX: Before the first option, drop short lines with no question words
+        # — these are stale answer overlays from the previous question
+        if not found_option and not is_option:
+            if len(line) <= 25 and not _QUESTION_WORDS.search(line) and "?" not in line:
+                # Likely a leftover answer bubble (e.g. "France", "Geoff Hurst")
+                continue
         cleaned.append(line)
     return "\n".join(cleaned)
 
@@ -77,7 +102,24 @@ def extract_question_only(cleaned: str) -> str:
     return " ".join(question_lines).strip()
 
 
-def is_valid_answer(text: str) -> bool:
+# ---------------------------------------------------------------------------
+# FIX 2: Parse the A/B/C/D option texts so we can validate the answer
+# actually matches one of them.
+# ---------------------------------------------------------------------------
+def extract_options(cleaned: str) -> list[str]:
+    options = []
+    for line in cleaned.splitlines():
+        if re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line):
+            text = re.sub(r'^[\(\[]?[A-D][\)\].]\s*', '', line).strip()
+            if text:
+                options.append(text.lower())
+    return options
+
+
+# ---------------------------------------------------------------------------
+# FIX 3: Validate answer against the actual options list.
+# ---------------------------------------------------------------------------
+def is_valid_answer(text: str, options: list[str] = None) -> bool:
     if not text:
         return False
     low = text.lower()
@@ -89,8 +131,12 @@ def is_valid_answer(text: str) -> bool:
     for r in refusals:
         if r in low:
             return False
-    if len(text) > 200:   # relaxed from 80 — short answers still win
+    if len(text) > 200:
         return False
+    # If we parsed options, answer must match one of them (fuzzy: contained-in)
+    if options:
+        if not any(low in opt or opt in low for opt in options):
+            return False
     return True
 
 
@@ -143,6 +189,7 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
     question_only = extract_question_only(cleaned)
+    options = extract_options(cleaned)  # FIX 2: parse options for validation
 
     search_context = await web_search(question_only)
 
@@ -186,7 +233,7 @@ async def answer(q: Question):
                 answer_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
                 answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
 
-                if is_valid_answer(answer_text):
+                if is_valid_answer(answer_text, options):  # FIX 3: pass options
                     return {"answer": answer_text, "model": model}
 
         except Exception as e:
