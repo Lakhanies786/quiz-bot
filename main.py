@@ -3,11 +3,39 @@ from pydantic import BaseModel
 import httpx
 import os
 import re
+import itertools
 
 app = FastAPI()
 
-GEMINI_KEY = os.getenv("API_KEY")   # same Railway variable — no change needed
+# ---------------------------------------------------------------------------
+# API Keys — supports multiple Gemini keys for quota rotation
+# Set GEMINI_KEY_1, GEMINI_KEY_2, GEMINI_KEY_3 in Railway variables
+# At minimum, GEMINI_KEY_1 must be set (your new key goes here)
+# ---------------------------------------------------------------------------
+_raw_keys = [
+    os.getenv("GEMINI_KEY_1"),
+    os.getenv("GEMINI_KEY_2"),
+    os.getenv("GEMINI_KEY_3"),
+]
+GEMINI_KEYS = [k for k in _raw_keys if k]
+
+# Fallback: also accept old variable name API_KEY
+if not GEMINI_KEYS:
+    old_key = os.getenv("API_KEY")
+    if old_key:
+        GEMINI_KEYS = [old_key]
+
+_key_cycle = itertools.cycle(GEMINI_KEYS) if GEMINI_KEYS else None
+
 SERPER_KEY = os.getenv("SERPER_KEY")
+
+# ---------------------------------------------------------------------------
+# Working Gemini models as of 2026 (2.0-flash retired March 2026)
+# ---------------------------------------------------------------------------
+MODELS = [
+    "gemini-2.5-flash-lite",  # 1000 RPD free — use first
+    "gemini-2.5-flash",       # 250 RPD free  — fallback
+]
 
 
 class Question(BaseModel):
@@ -54,15 +82,14 @@ def is_valid_answer(text: str) -> bool:
         return False
     low = text.lower()
     refusals = [
-        "i'm sorry", "i am sorry", "i cannot", "i can't", "i don't",
-        "the question", "as an ai", "unfortunately", "i'm unable",
-        "i need more", "not enough", "unclear", "i'm not able",
-        "based on the", "it appears", "i would need",
+        "i'm sorry", "i am sorry", "i cannot", "i can't",
+        "as an ai", "unfortunately", "i'm unable",
+        "i need more", "not enough", "i'm not able",
     ]
     for r in refusals:
         if r in low:
             return False
-    if len(text) > 80:
+    if len(text) > 200:   # relaxed from 80 — short answers still win
         return False
     return True
 
@@ -103,15 +130,16 @@ async def web_search(query: str) -> str:
 
 @app.get("/")
 async def health():
-    return {"status": "QuizBot backend running"}
+    key_count = len(GEMINI_KEYS)
+    return {"status": "QuizBot backend running", "gemini_keys_loaded": key_count}
 
 
 @app.post("/answer")
 async def answer(q: Question):
     if not q.text.strip():
         raise HTTPException(status_code=400, detail="Empty question")
-    if not GEMINI_KEY:
-        raise HTTPException(status_code=500, detail="API_KEY not set")
+    if not GEMINI_KEYS:
+        raise HTTPException(status_code=500, detail="No Gemini API key set. Add GEMINI_KEY_1 in Railway variables.")
 
     cleaned = clean_ocr_text(q.text)
     question_only = extract_question_only(cleaned)
@@ -136,26 +164,20 @@ async def answer(q: Question):
             + cleaned
         )
 
-    # Direct Gemini API — fastest models first, smallest as last fallback
-    models = [
-        "gemini-2.0-flash",       # fastest + smartest — use this most
-        "gemini-2.0-flash-lite",  # slightly cheaper, still fast
-        "gemini-1.5-flash-8b",    # smallest fallback if above fail
-    ]
-
     last_error = None
-    for model in models:
+    for model in MODELS:
+        gemini_key = next(_key_cycle)  # rotate through keys each attempt
         try:
-            async with httpx.AsyncClient(timeout=6) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 r = await client.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                    params={"key": GEMINI_KEY},
+                    params={"key": gemini_key},
                     headers={"Content-Type": "application/json"},
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
                         "generationConfig": {
                             "temperature": 0,
-                            "maxOutputTokens": 40,
+                            "maxOutputTokens": 60,
                         },
                     },
                 )
