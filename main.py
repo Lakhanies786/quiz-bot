@@ -138,9 +138,9 @@ async def answer(q: Question):
         )
 
     models = [
-        "google/gemini-2.5-flash",
-        "google/gemini-2.0-flash-lite",
-        "google/gemini-flash-1.5-8b",
+        "google/gemini-2.0-flash-001",
+        "google/gemini-2.0-flash-lite-001",
+        "google/gemini-1.5-flash",
     ]
 
     last_error = None
