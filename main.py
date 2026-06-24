@@ -7,7 +7,6 @@ import re
 app = FastAPI()
 
 API_KEY = os.getenv("API_KEY")
-SERPER_KEY = os.getenv("SERPER_KEY")
 
 
 class Question(BaseModel):
@@ -39,68 +38,6 @@ def clean_ocr_text(raw: str) -> str:
     return "\n".join(cleaned)
 
 
-def extract_question_only(cleaned: str) -> str:
-    lines = cleaned.splitlines()
-    question_lines = []
-    for line in lines:
-        if re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line):
-            break
-        question_lines.append(line)
-    return " ".join(question_lines).strip()
-
-
-def is_valid_answer(text: str) -> bool:
-    if not text:
-        return False
-    low = text.lower()
-    refusals = [
-        "i'm sorry", "i am sorry", "i cannot", "i can't", "i don't",
-        "the question", "as an ai", "unfortunately", "i'm unable",
-        "i need more", "not enough", "unclear", "i'm not able",
-        "based on the", "it appears", "i would need",
-    ]
-    for r in refusals:
-        if r in low:
-            return False
-    if len(text) > 80:
-        return False
-    return True
-
-
-async def web_search(query: str) -> str:
-    if not SERPER_KEY:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=4) as client:
-            r = await client.post(
-                "https://google.serper.dev/search",
-                headers={
-                    "X-API-KEY": SERPER_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={"q": query, "num": 5},
-            )
-            r.raise_for_status()
-            data = r.json()
-            snippets = []
-            if "answerBox" in data:
-                ab = data["answerBox"]
-                if "answer" in ab:
-                    snippets.append(ab["answer"])
-                elif "snippet" in ab:
-                    snippets.append(ab["snippet"])
-            if "knowledgeGraph" in data:
-                kg = data["knowledgeGraph"]
-                if "description" in kg:
-                    snippets.append(kg["description"])
-            for item in data.get("organic", [])[:3]:
-                if "snippet" in item:
-                    snippets.append(item["snippet"])
-            return "\n".join(snippets[:4])
-    except Exception:
-        return ""
-
-
 @app.get("/")
 async def health():
     return {"status": "QuizBot backend running"}
@@ -114,39 +51,28 @@ async def answer(q: Question):
         raise HTTPException(status_code=500, detail="API_KEY not set")
 
     cleaned = clean_ocr_text(q.text)
-    question_only = extract_question_only(cleaned)
 
-    # Search Google for context (runs in parallel with nothing — just await it)
-    search_context = await web_search(question_only)
+    prompt = """You are a precise quiz answer bot with strong general knowledge.
+Read the question and ALL options very carefully before answering.
+Think step by step about which option is factually correct.
+Then reply with ONLY the exact text of the correct answer option — copied exactly from the options.
+No letter prefix (no A/B/C/D), no explanation, just the answer words.
 
-    if search_context:
-        prompt = (
-            "You are a quiz answer bot.\n"
-            "Search results to help you:\n"
-            + search_context
-            + "\n\nUsing the search results, pick the correct answer option.\n"
-            "Reply with ONLY the exact text of the correct option — no letter, no explanation.\n\n"
-            "Question and options:\n"
-            + cleaned
-        )
-    else:
-        prompt = (
-            "You are a precise quiz answer bot.\n"
-            "Reply with ONLY the exact text of the correct answer option — no letter prefix, no explanation.\n\n"
-            "Question and options:\n"
-            + cleaned
-        )
+Important: For sports, geography, and current events questions — trust the most recent known facts.
 
+Question and options:
+""" + cleaned
+
+    # gemini-2.5-flash first (fast + accurate), lite as fallback only
     models = [
         "google/gemini-2.5-flash",
         "google/gemini-2.0-flash-lite",
-        "google/gemini-flash-1.5-8b",
     ]
 
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=6) as client:
+            async with httpx.AsyncClient(timeout=4) as client:  # reduced from 5s
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -157,25 +83,16 @@ async def answer(q: Question):
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0,
-                        "max_tokens": 40,
+                        "max_tokens": 30,   # reduced from 40 — answer is short
+                        "stream": False,
                     },
                 )
                 r.raise_for_status()
                 data = r.json()
-                # Safe content extraction — handle both string and list
-                content = data["choices"][0]["message"]["content"]
-                if isinstance(content, list):
-                    answer_text = " ".join(
-                        b.get("text", "") for b in content if isinstance(b, dict)
-                    ).strip()
-                else:
-                    answer_text = str(content).strip()
-
+                answer_text = data["choices"][0]["message"]["content"].strip()
                 answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
-
-                if is_valid_answer(answer_text):
+                if answer_text:
                     return {"answer": answer_text, "model": model}
-                # If invalid (refusal etc), try next model
         except Exception as e:
             last_error = e
             continue
