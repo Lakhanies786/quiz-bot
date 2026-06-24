@@ -59,20 +59,58 @@ Then reply with ONLY the exact text of the correct answer option — copied exac
 No letter prefix (no A/B/C/D), no explanation, just the answer words.
 
 Important: For sports, geography, and current events questions — trust the most recent known facts.
+If the question involves a specific statistic or obscure fact, use web search to verify before answering.
 
 Question and options:
 """ + cleaned
 
-    # gemini-2.5-flash first (fast + accurate), lite as fallback only
+    # Primary model with web search tool enabled — looks up obscure facts
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "google/gemini-2.5-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": 40,
+                    "tools": [{"type": "web_search"}],  # enable web search
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            # Extract text from all content blocks (web search returns multiple)
+            answer_text = ""
+            for block in data.get("choices", [{}])[0].get("message", {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    answer_text = block["text"].strip()
+                    break
+            # Fallback: content may be a plain string
+            if not answer_text:
+                raw_content = data["choices"][0]["message"]["content"]
+                if isinstance(raw_content, str):
+                    answer_text = raw_content.strip()
+            answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
+            if answer_text:
+                return {"answer": answer_text, "model": "google/gemini-2.5-flash+search"}
+    except Exception:
+        pass  # fall through to non-search fallbacks
+
+    # Fallbacks without web search
     models = [
         "google/gemini-2.5-flash",
         "google/gemini-2.0-flash-lite",
+        "google/gemini-flash-1.5-8b",
     ]
 
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=4) as client:  # reduced from 5s
+            async with httpx.AsyncClient(timeout=5) as client:
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -83,8 +121,7 @@ Question and options:
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0,
-                        "max_tokens": 30,   # reduced from 40 — answer is short
-                        "stream": False,
+                        "max_tokens": 40,
                     },
                 )
                 r.raise_for_status()
