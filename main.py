@@ -7,6 +7,7 @@ import re
 app = FastAPI()
 
 API_KEY = os.getenv("API_KEY")
+SERPER_KEY = os.getenv("SERPER_KEY")  # free at serper.dev — 2500 searches/month free
 
 
 class Question(BaseModel):
@@ -38,6 +39,96 @@ def clean_ocr_text(raw: str) -> str:
     return "\n".join(cleaned)
 
 
+def extract_question_only(cleaned: str) -> str:
+    """Extract just the question sentence for search query, without options."""
+    lines = cleaned.splitlines()
+    question_lines = []
+    for line in lines:
+        u = line.upper()
+        if re.match(r'^[A-D][.)]\s', line) or re.match(r'^\([A-D]\)', line):
+            break  # stop before options
+        question_lines.append(line)
+    return " ".join(question_lines).strip()
+
+
+def is_valid_answer(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    refusals = [
+        "i'm sorry", "i am sorry", "i cannot", "i can't", "i don't",
+        "the question", "as an ai", "unfortunately", "i'm unable",
+        "i need more", "not enough", "unclear", "i'm not able",
+        "based on the", "it appears", "i would need",
+    ]
+    for r in refusals:
+        if r in low:
+            return False
+    if len(text) > 80:
+        return False
+    return True
+
+
+async def web_search(query: str) -> str:
+    """Search Google via Serper API and return top snippets as context."""
+    if not SERPER_KEY:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            r = await client.post(
+                "https://google.serper.dev/search",
+                headers={
+                    "X-API-KEY": SERPER_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={"q": query, "num": 5},
+            )
+            r.raise_for_status()
+            data = r.json()
+            snippets = []
+            # Answer box (best source — direct answer)
+            if "answerBox" in data:
+                ab = data["answerBox"]
+                if "answer" in ab:
+                    snippets.append(ab["answer"])
+                elif "snippet" in ab:
+                    snippets.append(ab["snippet"])
+            # Knowledge graph
+            if "knowledgeGraph" in data:
+                kg = data["knowledgeGraph"]
+                if "description" in kg:
+                    snippets.append(kg["description"])
+            # Organic results
+            for item in data.get("organic", [])[:3]:
+                if "snippet" in item:
+                    snippets.append(item["snippet"])
+            return "\n".join(snippets[:4])
+    except Exception:
+        return ""
+
+
+async def call_model(prompt: str, model: str, timeout: int = 6) -> str:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": 40,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', text).strip()
+        return text
+
+
 @app.get("/")
 async def health():
     return {"status": "QuizBot backend running"}
@@ -51,56 +142,33 @@ async def answer(q: Question):
         raise HTTPException(status_code=500, detail="API_KEY not set")
 
     cleaned = clean_ocr_text(q.text)
+    question_only = extract_question_only(cleaned)
 
-    prompt = """You are a precise quiz answer bot with strong general knowledge.
-Read the question and ALL options very carefully before answering.
-Think step by step about which option is factually correct.
-Then reply with ONLY the exact text of the correct answer option — copied exactly from the options.
-No letter prefix (no A/B/C/D), no explanation, just the answer words.
+    # Step 1: search Google for the answer context
+    search_context = await web_search(question_only)
 
-Important: For sports, geography, and current events questions — trust the most recent known facts.
-If the question involves a specific statistic or obscure fact, use web search to verify before answering.
+    # Step 2: build prompt — with search context if available, without if not
+    if search_context:
+        prompt = f"""You are a precise quiz answer bot.
+You have been given real search results to help answer the question accurately.
+
+Search results:
+{search_context}
+
+Using the search results above, identify the correct answer option.
+Reply with ONLY the exact text of the correct option — no letter prefix, no explanation.
 
 Question and options:
-""" + cleaned
+{cleaned}"""
+    else:
+        prompt = f"""You are a precise quiz answer bot with strong general knowledge.
+Read the question and ALL options very carefully before answering.
+Reply with ONLY the exact text of the correct answer option — no letter prefix, no explanation.
 
-    # Primary model with web search tool enabled — looks up obscure facts
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "google/gemini-2.5-flash",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                    "max_tokens": 40,
-                    "tools": [{"type": "web_search"}],  # enable web search
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            # Extract text from all content blocks (web search returns multiple)
-            answer_text = ""
-            for block in data.get("choices", [{}])[0].get("message", {}).get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    answer_text = block["text"].strip()
-                    break
-            # Fallback: content may be a plain string
-            if not answer_text:
-                raw_content = data["choices"][0]["message"]["content"]
-                if isinstance(raw_content, str):
-                    answer_text = raw_content.strip()
-            answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
-            if answer_text:
-                return {"answer": answer_text, "model": "google/gemini-2.5-flash+search"}
-    except Exception:
-        pass  # fall through to non-search fallbacks
+Question and options:
+{cleaned}"""
 
-    # Fallbacks without web search
+    # Step 3: try models in order
     models = [
         "google/gemini-2.5-flash",
         "google/gemini-2.0-flash-lite",
@@ -110,26 +178,9 @@ Question and options:
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0,
-                        "max_tokens": 40,
-                    },
-                )
-                r.raise_for_status()
-                data = r.json()
-                answer_text = data["choices"][0]["message"]["content"].strip()
-                answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
-                if answer_text:
-                    return {"answer": answer_text, "model": model}
+            answer_text = await call_model(prompt, model)
+            if is_valid_answer(answer_text):
+                return {"answer": answer_text, "model": model}
         except Exception as e:
             last_error = e
             continue
