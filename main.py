@@ -63,16 +63,16 @@ Important: For sports, geography, and current events questions — trust the mos
 Question and options:
 """ + cleaned
 
+    # gemini-2.5-flash first (fast + accurate), lite as fallback only
     models = [
         "google/gemini-2.5-flash",
         "google/gemini-2.0-flash-lite",
-        "google/gemini-flash-1.5-8b",
     ]
 
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=4) as client:  # reduced from 5s
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -83,7 +83,8 @@ Question and options:
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0,
-                        "max_tokens": 40,
+                        "max_tokens": 30,   # reduced from 40 — answer is short
+                        "stream": False,
                     },
                 )
                 r.raise_for_status()
