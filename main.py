@@ -47,21 +47,27 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
 
-    prompt = """You are a quiz solver. Read the question and answer options below carefully.
-Identify the single correct answer and respond with ONLY the answer text itself.
-Do NOT include the option letter (A/B/C/D). Do NOT include any explanation.
-Keep it short - just the answer words, nothing else.
+    prompt = """You are a highly accurate general knowledge quiz solver.
+
+Read the question and all options carefully. Think about which answer is factually correct.
+Then respond with ONLY the exact text of the correct option — no letter, no explanation, nothing else.
+
+Rules:
+- Copy the answer text exactly as it appears in the options
+- Do NOT include the option letter (A, B, C, D) or number
+- Do NOT add any explanation or punctuation
+- If unsure, pick the most likely correct answer — never leave blank
 
 Example:
-Question: What is the capital of France?
-A) London  B) Berlin  C) Paris  D) Rome
-Your response: Paris
+Question: Which planet is closest to the Sun?
+A) Earth  B) Mars  C) Mercury  D) Venus
+Answer: Mercury
 
-Now answer this:
+Now solve this:
 """ + cleaned
 
     try:
-        async with httpx.AsyncClient(timeout=6) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
@@ -72,7 +78,7 @@ Now answer this:
                     "model": "google/gemini-2.5-flash",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
-                    "max_tokens": 30,
+                    "max_tokens": 50,
                 },
             )
             r.raise_for_status()
