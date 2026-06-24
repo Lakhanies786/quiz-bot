@@ -63,17 +63,16 @@ Important: For sports, geography, and current events questions — trust the mos
 Question and options:
 """ + cleaned
 
-    # Try fast models in order — fall back if one fails
+    # gemini-2.5-flash first (fast + accurate), lite as fallback only
     models = [
-        "google/gemini-2.5-flash",       # most accurate
-        "google/gemini-2.0-flash-lite",  # fallback
-        "google/gemini-flash-1.5-8b",   # last resort
+        "google/gemini-2.5-flash",
+        "google/gemini-2.0-flash-lite",
     ]
 
     last_error = None
     for model in models:
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=4) as client:  # reduced from 5s
                 r = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -84,13 +83,14 @@ Question and options:
                         "model": model,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0,
-                        "max_tokens": 40,
+                        "max_tokens": 30,   # reduced from 40 — answer is short
+                        "stream": False,
                     },
                 )
                 r.raise_for_status()
                 data = r.json()
                 answer_text = data["choices"][0]["message"]["content"].strip()
-                answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]\s*', '', answer_text).strip()
+                answer_text = re.sub(r'^[\(\[]?[A-Da-d][\)\]\.]?\s*', '', answer_text).strip()
                 if answer_text:
                     return {"answer": answer_text, "model": model}
         except Exception as e:
