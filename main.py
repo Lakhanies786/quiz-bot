@@ -22,31 +22,25 @@ def clean_and_reconstruct_ocr(raw: str) -> str:
     if not lines:
         return ""
     
-    # Find where options start (usually after question)
     option_lines = []
     question_lines = []
     option_labels = ['A', 'B', 'C', 'D', '1', '2', '3', '4']
     
     for i, line in enumerate(lines):
-        # If this line is JUST a letter, and next line exists, merge them
         if line in option_labels and i + 1 < len(lines):
             option_lines.append(f"{line}) {lines[i+1]}")
         elif line not in option_labels or i == 0:
-            # If it's a label but first line, or not a label, add to question
             if question_lines or not line in option_labels:
                 question_lines.append(line)
     
-    # If we didn't find properly formatted options, just return original
     if not option_lines:
         return raw
     
-    # Reconstruct
     result = "\n".join(question_lines) + "\n" + "\n".join(option_lines)
     return result.strip()
 
 def clean_ocr_text(raw: str) -> str:
     """Clean OCR text"""
-    # First try to fix malformed options
     fixed = clean_and_reconstruct_ocr(raw)
     
     lines = fixed.splitlines()
@@ -98,16 +92,25 @@ async def answer(q: Question):
     if not cleaned.strip():
         return {"answer": ""}
     
-    prompt = f"""You are a quiz answer bot. Your job is to pick the ONLY correct answer from the given options.
+    # Extract options for validation
+    option_lines = [line for line in cleaned.split('\n') if re.match(r'^[A-D\d][.)]\s', line)]
+    options_text = "\n".join(option_lines) if option_lines else ""
+    
+    prompt = f"""You are a quiz answer bot. Your ONLY job is to pick the CORRECT answer.
 
-IMPORTANT RULES:
-1. Reply with ONLY the exact text of the correct answer option
-2. Do NOT include the letter (A, B, C, D) or number (1, 2, 3)
-3. Do NOT include any explanation
-4. Just the answer text
+CRITICAL RULES:
+1. You MUST pick from ONLY these options:
+{options_text}
+
+2. Reply with ONLY the exact option text (without letter)
+3. Do NOT make up answers
+4. Do NOT add explanation
+5. MUST match one of the given options exactly
 
 Question and options:
-{cleaned}"""
+{cleaned}
+
+Your answer (MUST be one of the options above):"""
     
     try:
         async with httpx.AsyncClient(timeout=15) as client:
