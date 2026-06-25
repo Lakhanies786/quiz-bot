@@ -6,85 +6,84 @@ import re
 
 app = FastAPI()
 
-# Anthropic API Key
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-
-# Optional: web search (costs $0.01 per search). Set to False to disable.
-ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "false").lower() == "true"
-SERPER_KEY = os.getenv("SERPER_KEY", "")
-
 
 class Question(BaseModel):
     text: str
 
+def clean_and_reconstruct_ocr(raw: str) -> str:
+    """
+    Fix malformed OCR text where A, B, C, D are on separate lines.
+    Reconstruct it into: A) Option Text format
+    """
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    
+    if not lines:
+        return ""
+    
+    # Find where options start (usually after question)
+    option_lines = []
+    question_lines = []
+    option_labels = ['A', 'B', 'C', 'D', '1', '2', '3', '4']
+    
+    for i, line in enumerate(lines):
+        # If this line is JUST a letter, and next line exists, merge them
+        if line in option_labels and i + 1 < len(lines):
+            option_lines.append(f"{line}) {lines[i+1]}")
+        elif line not in option_labels or i == 0:
+            # If it's a label but first line, or not a label, add to question
+            if question_lines or not line in option_labels:
+                question_lines.append(line)
+    
+    # If we didn't find properly formatted options, just return original
+    if not option_lines:
+        return raw
+    
+    # Reconstruct
+    result = "\n".join(question_lines) + "\n" + "\n".join(option_lines)
+    return result.strip()
 
 def clean_ocr_text(raw: str) -> str:
-    """Strip stale overlay text and junk"""
-    lines = raw.splitlines()
+    """Clean OCR text"""
+    # First try to fix malformed options
+    fixed = clean_and_reconstruct_ocr(raw)
+    
+    lines = fixed.splitlines()
     cleaned = []
     found_option = False
+    
+    junk_phrases = {
+        "reply with your answer", "ask another", "send", "choose the correct answer",
+        "correct!", "incorrect!", "reply with a, b, c, or d"
+    }
     
     for line in lines:
         line = line.strip()
         if not line:
             continue
         
-        # Skip low-quality noise
-        if line.lower() in {"send", "reply with a, b, c, or d", "choose the correct answer", 
-                             "correct!", "incorrect!", "reply with your answer"}:
+        if any(junk in line.lower() for junk in junk_phrases):
             continue
         
-        is_option = bool(re.match(r'^[A-D][.)]\s', line))
+        is_option = bool(re.match(r'^[A-D\d][.)]\s', line))
         if is_option:
             found_option = True
         
-        # Before first option, skip short junk (stale answer bubbles)
-        if not found_option and not is_option and len(line) <= 20 and "?" not in line:
+        if not found_option and not is_option and len(line) < 15 and "?" not in line:
             continue
         
         cleaned.append(line)
     
     return "\n".join(cleaned)
 
-
-async def web_search(query: str) -> str:
-    """Optional web search. Costs $0.01 per call."""
-    if not ENABLE_WEB_SEARCH or not SERPER_KEY:
-        return ""
-    
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            r = await client.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": SERPER_KEY, "Content-Type": "application/json"},
-                json={"q": query, "num": 3},
-            )
-            r.raise_for_status()
-            data = r.json()
-            snippets = []
-            
-            if "answerBox" in data and "answer" in data["answerBox"]:
-                snippets.append(data["answerBox"]["answer"])
-            
-            for item in data.get("organic", [])[:2]:
-                if "snippet" in item:
-                    snippets.append(item["snippet"])
-            
-            return " ".join(snippets[:2])
-    except Exception:
-        return ""
-
-
 @app.get("/")
 async def health():
     return {
         "status": "QuizBot running",
         "model": ANTHROPIC_MODEL,
-        "web_search_enabled": ENABLE_WEB_SEARCH,
         "api_key_loaded": bool(ANTHROPIC_API_KEY),
     }
-
 
 @app.post("/answer")
 async def answer(q: Question):
@@ -96,20 +95,22 @@ async def answer(q: Question):
 
     cleaned = clean_ocr_text(q.text)
     
-    # Get search context only if enabled (costs $0.01)
-    search_context = ""
-    if ENABLE_WEB_SEARCH:
-        first_line = cleaned.split("\n")[0]
-        search_context = await web_search(first_line)
+    if not cleaned.strip():
+        return {"answer": ""}
+    
+    prompt = f"""You are a quiz answer bot. Your job is to pick the ONLY correct answer from the given options.
 
-    # Build minimal prompt
-    if search_context:
-        prompt = f"Search: {search_context}\n\nPick the correct answer. Reply ONLY the exact option text, no letter.\n\n{cleaned}"
-    else:
-        prompt = f"Pick the correct answer from the options. Reply ONLY the exact text of the correct option, no letter or explanation.\n\n{cleaned}"
+IMPORTANT RULES:
+1. Reply with ONLY the exact text of the correct answer option
+2. Do NOT include the letter (A, B, C, D) or number (1, 2, 3)
+3. Do NOT include any explanation
+4. Just the answer text
 
+Question and options:
+{cleaned}"""
+    
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -119,20 +120,23 @@ async def answer(q: Question):
                 },
                 json={
                     "model": ANTHROPIC_MODEL,
-                    "max_tokens": 30,
+                    "max_tokens": 50,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
-            r.raise_for_status()
+            
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"API error: {r.status_code}")
+            
             data = r.json()
             answer_text = data["content"][0]["text"].strip()
             
-            # Remove accidental letter prefix if present
-            answer_text = re.sub(r'^[A-D][.)]\s*', '', answer_text).strip()
+            # Strip letter prefix if present
+            answer_text = re.sub(r'^[A-D\d][.)]\s*', '', answer_text).strip()
             
             return {"answer": answer_text}
 
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=f"API error: {e.response.status_code}")
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed: {str(e)}")
