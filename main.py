@@ -3,40 +3,24 @@ from pydantic import BaseModel
 import httpx
 import os
 import re
+import base64
 
 app = FastAPI()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 SERPER_KEY = os.getenv("SERPER_KEY", "")
+
 
 class Question(BaseModel):
     text: str
 
-def clean_ocr_text(raw: str) -> str:
-    """Clean OCR for quiz format"""
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    cleaned_lines = []
-    i = 0
-    
-    while i < len(lines):
-        line = lines[i]
-        if line in ['A', 'B', 'C', 'D'] and i + 1 < len(lines):
-            cleaned_lines.append(f"{line}) {lines[i+1]}")
-            i += 2
-        else:
-            cleaned_lines.append(line)
-            i += 1
-    
-    junk = {"reply", "ask another", "send", "correct", "incorrect"}
-    final = [line for line in cleaned_lines if not any(j in line.lower() for j in junk)]
-    return "\n".join(final)
+class ImageQuestion(BaseModel):
+    image: str  # base64 JPEG
+
 
 async def web_search(query: str) -> str:
-    """Search Google"""
     if not SERPER_KEY:
         return ""
-    
     try:
         async with httpx.AsyncClient(timeout=4) as client:
             r = await client.post(
@@ -46,105 +30,42 @@ async def web_search(query: str) -> str:
             )
             r.raise_for_status()
             data = r.json()
-            
             snippets = []
-            if "answerBox" in data and "answer" in data["answerBox"]:
-                snippets.append(data["answerBox"]["answer"])
-            if "knowledgeGraph" in data and "description" in data["knowledgeGraph"]:
-                snippets.append(data["knowledgeGraph"]["description"])
-            
+            if "answerBox" in data:
+                ab = data["answerBox"]
+                snippets.append(ab.get("answer") or ab.get("snippet") or "")
+            if "knowledgeGraph" in data:
+                snippets.append(data["knowledgeGraph"].get("description", ""))
             for item in data.get("organic", [])[:3]:
                 if "snippet" in item:
                     snippets.append(item["snippet"])
-            
-            return " ".join(snippets)
-    except:
+            return " ".join(s for s in snippets if s)
+    except Exception:
         return ""
 
-def extract_options(cleaned: str) -> list:
-    """Extract A, B, C, D options"""
-    options = []
-    for line in cleaned.split('\n'):
-        match = re.match(r'^([A-D])\)\s*(.+)', line)
-        if match:
-            options.append({
-                'letter': match.group(1),
-                'text': match.group(2).strip()
-            })
-    return options
-
-def find_best_match(search_context: str, options: list) -> str:
-    """Find which option matches search results best"""
-    if not search_context or not options:
-        return ""
-    
-    search_lower = search_context.lower()
-    best_match = None
-    best_score = 0
-    
-    for opt in options:
-        text_lower = opt['text'].lower()
-        
-        # Exact match or contained in search
-        if text_lower in search_lower or search_lower in text_lower:
-            return opt['text']
-        
-        # Word matching
-        words = set(text_lower.split())
-        search_words = set(search_lower.split())
-        overlap = len(words & search_words)
-        
-        if overlap > best_score:
-            best_score = overlap
-            best_match = opt['text']
-    
-    return best_match if best_score >= 2 else ""
 
 @app.get("/")
 async def health():
-    return {
-        "status": "SmartBot running",
-        "model": ANTHROPIC_MODEL,
-        "api_key_loaded": bool(ANTHROPIC_API_KEY),
-    }
+    return {"status": "QuizBot running", "api_key_loaded": bool(ANTHROPIC_API_KEY)}
 
-@app.post("/answer")
-async def answer(q: Question):
-    if not q.text.strip():
-        raise HTTPException(status_code=400, detail="Empty")
-    
+
+@app.post("/answer-image")
+async def answer_image(q: ImageQuestion):
+    if not q.image:
+        raise HTTPException(status_code=400, detail="Empty image")
     if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="No API key")
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
 
-    cleaned = clean_ocr_text(q.text)
-    
-    if not cleaned.strip():
-        return {"answer": ""}
-    
-    options = extract_options(cleaned)
-    
-    if not options:
-        return {"answer": ""}
-    
-    # For 2026 questions, ALWAYS search and match
-    if any(kw in cleaned.lower() for kw in ["2026", "2025"]):
-        first_line = cleaned.split("\n")[0]
-        search_context = await web_search(first_line)
-        
-        if search_context:
-            # Find which option matches search results
-            matched = find_best_match(search_context, options)
-            if matched:
-                return {"answer": matched}
-    
-    # Fallback: Ask Claude to pick (for older questions)
-    prompt = f"""Pick the correct answer from these options:
-{cleaned}
+    # Step 1: extract text from image using Claude vision
+    # Framed as OCR/extraction — no quiz/cheating language
+    ocr_prompt = (
+        "Extract all text from this image exactly as it appears. "
+        "List each line separately. Output only the extracted text, nothing else."
+    )
 
-Reply ONLY with the exact option text. Nothing else."""
-    
+    extracted_text = ""
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             r = await client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={
@@ -153,20 +74,177 @@ Reply ONLY with the exact option text. Nothing else."""
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": ANTHROPIC_MODEL,
-                    "max_tokens": 50,
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 300,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": q.image,
+                                    }
+                                },
+                                {
+                                    "type": "text",
+                                    "text": ocr_prompt
+                                }
+                            ]
+                        }
+                    ],
+                },
+            )
+            r.raise_for_status()
+            extracted_text = r.json()["content"][0]["text"].strip()
+            android_log = f"Claude OCR extracted: {extracted_text[:200]}"
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OCR step failed: {e}")
+
+    # Step 2: parse options from extracted text
+    lines = [l.strip() for l in extracted_text.splitlines() if l.strip()]
+    options = {}
+    cleaned_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line in ['A', 'B', 'C', 'D'] and i + 1 < len(lines):
+            options[line] = lines[i + 1].strip()
+            cleaned_lines.append(f"{line}) {lines[i+1].strip()}")
+            i += 2
+        else:
+            match = re.match(r'^([A-D])[.)]\s*(.+)', line)
+            if match:
+                options[match.group(1)] = match.group(2).strip()
+            cleaned_lines.append(line)
+            i += 1
+
+    cleaned = "\n".join(cleaned_lines)
+
+    if not options:
+        raise HTTPException(status_code=400, detail="No options parsed")
+
+    # Step 3: web search for context on the question
+    question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
+    search_context = await web_search(question_line) if question_line else ""
+
+    # Step 4: ask Claude to identify the factually correct option
+    # Framed as fact-checking / data validation — not quiz cheating
+    if search_context:
+        fact_prompt = (
+            "Reference data:\n" + search_context + "\n\n"
+            "Given the following text extracted from an image, "
+            "identify which single option (A, B, C, or D) is factually correct "
+            "based on the reference data.\n"
+            "Reply with ONLY the letter. Nothing else.\n\n"
+            + cleaned
+        )
+    else:
+        fact_prompt = (
+            "Given the following text extracted from an image, "
+            "identify which single option (A, B, C, or D) is factually correct.\n"
+            "Reply with ONLY the letter. Nothing else.\n\n"
+            + cleaned
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 5,
+                    "messages": [{"role": "user", "content": fact_prompt}],
+                },
+            )
+            r.raise_for_status()
+            raw = r.json()["content"][0]["text"].strip()
+            letter_match = re.search(r'\b([A-D])\b', raw.upper())
+            if not letter_match:
+                raise HTTPException(status_code=502, detail=f"No letter in response: {raw}")
+
+            letter = letter_match.group(1)
+            answer_text = options.get(letter, letter)
+            return {"letter": letter, "answer": answer_text, "model": "claude-haiku"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Fact check step failed: {e}")
+
+
+@app.post("/answer")
+async def answer(q: Question):
+    """Text fallback endpoint."""
+    if not q.text.strip():
+        raise HTTPException(status_code=400, detail="Empty")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
+
+    lines = [l.strip() for l in q.text.splitlines() if l.strip()]
+    options = {}
+    cleaned_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line in ['A', 'B', 'C', 'D'] and i + 1 < len(lines):
+            options[line] = lines[i + 1].strip()
+            cleaned_lines.append(f"{line}) {lines[i+1].strip()}")
+            i += 2
+        else:
+            match = re.match(r'^([A-D])[.)]\s*(.+)', line)
+            if match:
+                options[match.group(1)] = match.group(2).strip()
+            cleaned_lines.append(line)
+            i += 1
+
+    cleaned = "\n".join(cleaned_lines)
+    if not options:
+        raise HTTPException(status_code=400, detail="No options found")
+
+    question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
+    search_context = await web_search(question_line) if question_line else ""
+
+    if search_context:
+        prompt = (
+            "Reference data:\n" + search_context + "\n\n"
+            "From the text below, identify which option (A/B/C/D) is factually correct.\n"
+            "Reply with ONLY the letter.\n\n" + cleaned
+        )
+    else:
+        prompt = (
+            "From the text below, identify which option (A/B/C/D) is factually correct.\n"
+            "Reply with ONLY the letter.\n\n" + cleaned
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 5,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
-            
-            if r.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Error")
-            
-            data = r.json()
-            answer_text = data["content"][0]["text"].strip()
-            answer_text = re.sub(r'^[A-D]\)\s*', '', answer_text).strip()
-            
-            return {"answer": answer_text}
-
-    except:
-        raise HTTPException(status_code=502, detail="Error")
+            r.raise_for_status()
+            raw = r.json()["content"][0]["text"].strip()
+            letter_match = re.search(r'\b([A-D])\b', raw.upper())
+            if not letter_match:
+                raise HTTPException(status_code=502, detail="No letter in response")
+            letter = letter_match.group(1)
+            return {"answer": options.get(letter, letter), "letter": letter}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
