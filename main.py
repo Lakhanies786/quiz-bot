@@ -39,13 +39,14 @@ async def web_search(query: str) -> str:
             for item in data.get("organic", [])[:3]:
                 if "snippet" in item:
                     snippets.append(item["snippet"])
-            return " ".join(s for s in snippets if s)
+            return " ".join(s for s in snippets if s)[:600]
     except Exception:
         return ""
 
 
-async def claude_call(messages: list, max_tokens: int = 10) -> str:
-    async with httpx.AsyncClient(timeout=7) as client:
+async def claude_ocr(image_b64: str) -> str:
+    """Fast OCR using Haiku — just extract text."""
+    async with httpx.AsyncClient(timeout=8) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -55,16 +56,70 @@ async def claude_call(messages: list, max_tokens: int = 10) -> str:
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": max_tokens,
-                "messages": messages,
+                "max_tokens": 300,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": image_b64,
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Extract all text from this image exactly as it appears. "
+                                    "List each line separately. Output only the extracted text, nothing else."
+                                )
+                            }
+                        ]
+                    }
+                ],
             },
         )
         r.raise_for_status()
         return r.json()["content"][0]["text"].strip()
 
 
-def parse_options(lines: list) -> tuple[dict, list]:
-    """Returns (options dict, cleaned lines list)"""
+async def claude_reason(cleaned: str, search_context: str) -> str:
+    """Accurate reasoning using Sonnet — returns just the letter."""
+    if search_context:
+        prompt = (
+            "Reference facts from web search:\n" + search_context + "\n\n"
+            "Text extracted from image:\n" + cleaned + "\n\n"
+            "Using the reference facts, which single option (A, B, C, or D) is factually correct?\n"
+            "Reply with ONLY the letter. Nothing else."
+        )
+    else:
+        prompt = (
+            "Text extracted from image:\n" + cleaned + "\n\n"
+            "Which single option (A, B, C, or D) is factually correct?\n"
+            "Reply with ONLY the letter. Nothing else."
+        )
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",  # more accurate than haiku
+                "max_tokens": 5,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        r.raise_for_status()
+        return r.json()["content"][0]["text"].strip()
+
+
+def parse_options(lines: list) -> tuple:
     options = {}
     cleaned_lines = []
     i = 0
@@ -95,40 +150,13 @@ async def answer_image(q: ImageQuestion):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
 
-    # ── Single Claude call: OCR + identify correct option in one shot ──────
-    # Serper needs the question text first, so we do OCR first (fast),
-    # then fire Serper + fact-check in parallel.
-
-    # Step 1: OCR only — fast, just extract text (no reasoning yet)
-    ocr_messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": q.image,
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "Extract all text from this image exactly as it appears. "
-                        "List each line separately. Output only the extracted text, nothing else."
-                    )
-                }
-            ]
-        }
-    ]
-
+    # Step 1: OCR with Haiku (fast)
     try:
-        extracted_text = await claude_call(ocr_messages, max_tokens=300)
+        extracted_text = await claude_ocr(q.image)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OCR failed: {e}")
 
-    # Parse options and question line
+    # Parse options
     lines = [l.strip() for l in extracted_text.splitlines() if l.strip()]
     options, cleaned_lines = parse_options(lines)
     cleaned = "\n".join(cleaned_lines)
@@ -136,57 +164,38 @@ async def answer_image(q: ImageQuestion):
     if not options:
         raise HTTPException(status_code=400, detail="No options parsed")
 
+    # Step 2: web search + reasoning IN PARALLEL
     question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
 
-    # Step 2: Serper search + Claude fact-check IN PARALLEL
-    async def fact_check(search_context: str) -> str:
+    search_task = asyncio.create_task(web_search(question_line))
+    # Start reasoning immediately without search, also start search
+    reason_no_search_task = asyncio.create_task(claude_reason(cleaned, ""))
+
+    # Wait for search (max 3s) — if it finishes before reasoning, use it
+    try:
+        search_context = await asyncio.wait_for(search_task, timeout=3.0)
+    except asyncio.TimeoutError:
+        search_context = ""
+
+    # Get reasoning result
+    try:
         if search_context:
-            prompt = (
-                "Reference data:\n" + search_context + "\n\n"
-                "From the text below, identify which single option (A, B, C, or D) "
-                "is factually correct based on the reference data.\n"
-                "Reply with ONLY the letter. Nothing else.\n\n"
-                + cleaned
-            )
+            # Search came back — cancel no-search task, run with context
+            reason_no_search_task.cancel()
+            raw_letter = await claude_reason(cleaned, search_context)
         else:
-            prompt = (
-                "From the text below, identify which single option (A, B, C, or D) "
-                "is factually correct.\n"
-                "Reply with ONLY the letter. Nothing else.\n\n"
-                + cleaned
-            )
-        return await claude_call(
-            [{"role": "user", "content": prompt}],
-            max_tokens=5
-        )
+            # No search — use the already-running no-search task
+            raw_letter = await reason_no_search_task
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Reasoning failed: {e}")
 
-    # Run Serper search and fact-check simultaneously
-    search_context, raw_letter = await asyncio.gather(
-        web_search(question_line),
-        fact_check("")  # start immediately without search
-    )
-
-    # If search returned results and letter seems uncertain, re-check with context
-    # (only if search finished fast enough — which it usually does)
     letter_match = re.search(r'\b([A-D])\b', raw_letter.upper())
     if not letter_match:
-        raise HTTPException(status_code=502, detail=f"No letter in response: {raw_letter}")
+        raise HTTPException(status_code=502, detail=f"No letter in: {raw_letter}")
 
     letter = letter_match.group(1)
-
-    # If we got search context, do one more fast check with it
-    # This adds ~1s but only when serper has useful data
-    if search_context:
-        try:
-            refined = await fact_check(search_context)
-            refined_match = re.search(r'\b([A-D])\b', refined.upper())
-            if refined_match:
-                letter = refined_match.group(1)
-        except Exception:
-            pass  # keep original letter
-
-    answer_text = options.get(letter, letter)
-    return {"letter": letter, "answer": answer_text, "model": "claude-haiku"}
+    answer_text = options.get(letter, "")
+    return {"letter": letter, "answer": answer_text, "model": "haiku-ocr+sonnet-reason"}
 
 
 @app.post("/answer")
@@ -206,24 +215,12 @@ async def answer(q: Question):
     question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
     search_context = await web_search(question_line)
 
-    if search_context:
-        prompt = (
-            "Reference data:\n" + search_context + "\n\n"
-            "From the text below, identify which option (A/B/C/D) is factually correct.\n"
-            "Reply with ONLY the letter.\n\n" + cleaned
-        )
-    else:
-        prompt = (
-            "From the text below, identify which option (A/B/C/D) is factually correct.\n"
-            "Reply with ONLY the letter.\n\n" + cleaned
-        )
-
     try:
-        raw = await claude_call([{"role": "user", "content": prompt}], max_tokens=5)
-        letter_match = re.search(r'\b([A-D])\b', raw.upper())
-        if not letter_match:
-            raise HTTPException(status_code=502, detail="No letter in response")
-        letter = letter_match.group(1)
+        raw = await claude_reason(cleaned, search_context)
+        m = re.search(r'\b([A-D])\b', raw.upper())
+        if not m:
+            raise HTTPException(status_code=502, detail="No letter")
+        letter = m.group(1)
         return {"answer": options.get(letter, letter), "letter": letter}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
