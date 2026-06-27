@@ -10,12 +10,16 @@ app = FastAPI()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SERPER_KEY = os.getenv("SERPER_KEY", "")
 
+# Correct model strings
+MODEL_OCR = "claude-haiku-4-5-20251001"
+MODEL_REASON = "claude-sonnet-4-6"
+
 
 class Question(BaseModel):
     text: str
 
 class ImageQuestion(BaseModel):
-    image: str  # base64 JPEG
+    image: str
 
 
 async def web_search(query: str) -> str:
@@ -44,9 +48,8 @@ async def web_search(query: str) -> str:
         return ""
 
 
-async def claude_ocr(image_b64: str) -> str:
-    """Fast OCR using Haiku — just extract text."""
-    async with httpx.AsyncClient(timeout=8) as client:
+async def anthropic_call(model: str, messages: list, max_tokens: int) -> str:
+    async with httpx.AsyncClient(timeout=12) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -55,64 +58,9 @@ async def claude_ocr(image_b64: str) -> str:
                 "Content-Type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 300,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": "image/jpeg",
-                                    "data": image_b64,
-                                }
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Extract all text from this image exactly as it appears. "
-                                    "List each line separately. Output only the extracted text, nothing else."
-                                )
-                            }
-                        ]
-                    }
-                ],
-            },
-        )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"].strip()
-
-
-async def claude_reason(cleaned: str, search_context: str) -> str:
-    """Accurate reasoning using Sonnet — returns just the letter."""
-    if search_context:
-        prompt = (
-            "Reference facts from web search:\n" + search_context + "\n\n"
-            "Text extracted from image:\n" + cleaned + "\n\n"
-            "Using the reference facts, which single option (A, B, C, or D) is factually correct?\n"
-            "Reply with ONLY the letter. Nothing else."
-        )
-    else:
-        prompt = (
-            "Text extracted from image:\n" + cleaned + "\n\n"
-            "Which single option (A, B, C, or D) is factually correct?\n"
-            "Reply with ONLY the letter. Nothing else."
-        )
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",  # more accurate than haiku
-                "max_tokens": 5,
-                "messages": [{"role": "user", "content": prompt}],
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": messages,
             },
         )
         r.raise_for_status()
@@ -150,52 +98,81 @@ async def answer_image(q: ImageQuestion):
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
 
-    # Step 1: OCR with Haiku (fast)
+    # Step 1: OCR with Haiku — extract text from image
     try:
-        extracted_text = await claude_ocr(q.image)
+        extracted_text = await anthropic_call(
+            model=MODEL_OCR,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": q.image}
+                    },
+                    {
+                        "type": "text",
+                        "text": "Extract all text from this image exactly as it appears. List each line separately. Output only the extracted text, nothing else."
+                    }
+                ]
+            }],
+            max_tokens=300
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OCR failed: {e}")
 
-    # Parse options
+    # Parse options from extracted text
     lines = [l.strip() for l in extracted_text.splitlines() if l.strip()]
     options, cleaned_lines = parse_options(lines)
     cleaned = "\n".join(cleaned_lines)
 
     if not options:
-        raise HTTPException(status_code=400, detail="No options parsed")
+        raise HTTPException(status_code=400, detail=f"No options in: {extracted_text[:200]}")
 
-    # Step 2: web search + reasoning IN PARALLEL
+    # Step 2: Run web search and reasoning TRULY in parallel
     question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
 
-    search_task = asyncio.create_task(web_search(question_line))
-    # Start reasoning immediately without search, also start search
-    reason_no_search_task = asyncio.create_task(claude_reason(cleaned, ""))
+    def make_reason_prompt(ctx: str) -> str:
+        base = "Text extracted from image:\n" + cleaned + "\n\nWhich single option (A, B, C, or D) is factually correct?\nReply with ONLY the letter. Nothing else."
+        if ctx:
+            return "Reference facts:\n" + ctx + "\n\n" + base
+        return base
 
-    # Wait for search (max 3s) — if it finishes before reasoning, use it
-    try:
-        search_context = await asyncio.wait_for(search_task, timeout=3.0)
-    except asyncio.TimeoutError:
-        search_context = ""
+    # Run both simultaneously — search for context, reason without it
+    search_result, reason_result = await asyncio.gather(
+        web_search(question_line),
+        anthropic_call(
+            model=MODEL_REASON,
+            messages=[{"role": "user", "content": make_reason_prompt("")}],
+            max_tokens=5
+        ),
+        return_exceptions=True
+    )
 
-    # Get reasoning result
-    try:
-        if search_context:
-            # Search came back — cancel no-search task, run with context
-            reason_no_search_task.cancel()
-            raw_letter = await claude_reason(cleaned, search_context)
-        else:
-            # No search — use the already-running no-search task
-            raw_letter = await reason_no_search_task
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Reasoning failed: {e}")
+    # Use search-enhanced reasoning only if search returned useful data
+    # and reasoning without search gave a valid letter
+    search_context = search_result if isinstance(search_result, str) else ""
+    raw_letter = reason_result if isinstance(reason_result, str) else ""
+
+    # If search has data, do one more quick reasoning call with context
+    # (Sonnet is fast enough at max_tokens=5)
+    if search_context:
+        try:
+            refined = await anthropic_call(
+                model=MODEL_REASON,
+                messages=[{"role": "user", "content": make_reason_prompt(search_context)}],
+                max_tokens=5
+            )
+            raw_letter = refined  # prefer search-informed answer
+        except Exception:
+            pass  # keep original raw_letter
 
     letter_match = re.search(r'\b([A-D])\b', raw_letter.upper())
     if not letter_match:
-        raise HTTPException(status_code=502, detail=f"No letter in: {raw_letter}")
+        raise HTTPException(status_code=502, detail=f"No letter in response: '{raw_letter}'")
 
     letter = letter_match.group(1)
     answer_text = options.get(letter, "")
-    return {"letter": letter, "answer": answer_text, "model": "haiku-ocr+sonnet-reason"}
+    return {"letter": letter, "answer": answer_text, "model": f"{MODEL_OCR}+{MODEL_REASON}"}
 
 
 @app.post("/answer")
@@ -215,11 +192,14 @@ async def answer(q: Question):
     question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
     search_context = await web_search(question_line)
 
+    prompt = ("Reference facts:\n" + search_context + "\n\n" if search_context else "") + \
+             "Which single option (A, B, C, or D) is factually correct?\nReply with ONLY the letter.\n\n" + cleaned
+
     try:
-        raw = await claude_reason(cleaned, search_context)
+        raw = await anthropic_call(MODEL_REASON, [{"role": "user", "content": prompt}], 5)
         m = re.search(r'\b([A-D])\b', raw.upper())
         if not m:
-            raise HTTPException(status_code=502, detail="No letter")
+            raise HTTPException(status_code=502, detail=f"No letter: {raw}")
         letter = m.group(1)
         return {"answer": options.get(letter, letter), "letter": letter}
     except Exception as e:
