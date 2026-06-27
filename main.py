@@ -9,7 +9,6 @@ app = FastAPI()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SERPER_KEY = os.getenv("SERPER_KEY", "")
-
 MODEL_REASON = "claude-sonnet-4-6"
 
 
@@ -17,29 +16,25 @@ class Question(BaseModel):
     text: str
 
 
-def parse_options(text: str) -> tuple:
-    """Returns (options dict, cleaned text, question line)"""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    options = {}
-    cleaned_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Handle bare letter on its own line (A, B, C, D) followed by answer
-        if line in ['A', 'B', 'C', 'D'] and i + 1 < len(lines):
-            options[line] = lines[i + 1].strip()
-            cleaned_lines.append(f"{line}) {lines[i+1].strip()}")
-            i += 2
-        else:
-            m = re.match(r'^([A-D])[.)]\s*(.+)', line)
-            if m:
-                options[m.group(1)] = m.group(2).strip()
-            cleaned_lines.append(line)
-            i += 1
-
-    cleaned = "\n".join(cleaned_lines)
-    question_line = next((l for l in cleaned_lines if "?" in l), cleaned_lines[0] if cleaned_lines else "")
-    return options, cleaned, question_line
+def clean_ocr(text: str) -> str:
+    """Remove obvious junk lines, keep question + all option texts."""
+    junk = [
+        "reply", "time is up", "see score", "points", "next question",
+        "ask another", "send", "correct!", "incorrect!", "question of"
+    ]
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Skip standalone single letters A-D and X (OCR artifacts from option circles)
+        if re.match(r'^[A-DX]$', line):
+            continue
+        # Skip junk
+        if any(j in line.lower() for j in junk):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 async def web_search(query: str) -> str:
@@ -68,13 +63,15 @@ async def web_search(query: str) -> str:
         return ""
 
 
-async def claude_reason(cleaned: str, search_context: str) -> str:
-    """Single Claude Sonnet call — returns just the letter."""
+async def claude_answer(cleaned: str, search_context: str) -> str:
+    """Ask Claude to return the correct answer text directly — no letter."""
     prompt = (
-        ("Reference facts:\n" + search_context + "\n\n" if search_context else "") +
-        "Text:\n" + cleaned + "\n\n"
-        "Which single option (A, B, C, or D) is factually correct?\n"
-        "Reply with ONLY the letter. Nothing else."
+        ("Reference facts from web search:\n" + search_context + "\n\n" if search_context else "") +
+        "Below is text extracted from a quiz question screen.\n"
+        "Identify the question and the answer options.\n"
+        "Reply with ONLY the exact text of the correct answer option — nothing else.\n"
+        "No letter prefix, no explanation, just the answer words as they appear.\n\n"
+        + cleaned
     )
     async with httpx.AsyncClient(timeout=12) as client:
         r = await client.post(
@@ -86,7 +83,7 @@ async def claude_reason(cleaned: str, search_context: str) -> str:
             },
             json={
                 "model": MODEL_REASON,
-                "max_tokens": 5,
+                "max_tokens": 30,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -101,43 +98,43 @@ async def health():
 
 @app.post("/answer")
 async def answer(q: Question):
-    """
-    Receives OCR text from ML Kit (on-device).
-    Runs Serper search + Claude Sonnet reasoning in parallel.
-    Returns letter + full answer text.
-    """
     if not q.text.strip():
         raise HTTPException(status_code=400, detail="Empty")
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
 
-    options, cleaned, question_line = parse_options(q.text)
+    cleaned = clean_ocr(q.text)
 
-    if not options:
-        raise HTTPException(status_code=400, detail=f"No options found in: {q.text[:100]}")
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="No usable text")
 
-    # Run Serper search and Claude reasoning in parallel
+    # Extract question line for search
+    question_line = next(
+        (l for l in cleaned.splitlines() if "?" in l),
+        cleaned.splitlines()[0] if cleaned.splitlines() else ""
+    )
+
+    # Run search and reasoning in parallel
     search_result, reason_result = await asyncio.gather(
         web_search(question_line),
-        claude_reason(cleaned, ""),   # start immediately without search
+        claude_answer(cleaned, ""),
         return_exceptions=True
     )
 
     search_context = search_result if isinstance(search_result, str) else ""
-    raw_letter = reason_result if isinstance(reason_result, str) else ""
+    answer_text = reason_result if isinstance(reason_result, str) else ""
 
-    # If search returned data, do one refined call with context
-    if search_context and isinstance(reason_result, str):
+    # If search returned data, refine
+    if search_context:
         try:
-            refined = await claude_reason(cleaned, search_context)
-            raw_letter = refined
+            answer_text = await claude_answer(cleaned, search_context)
         except Exception:
-            pass  # keep original
+            pass
 
-    letter_match = re.search(r'\b([A-D])\b', raw_letter.upper())
-    if not letter_match:
-        raise HTTPException(status_code=502, detail=f"No letter in: '{raw_letter}'")
+    # Reject obvious refusals
+    if not answer_text or any(x in answer_text.lower() for x in [
+        "i cannot", "i'm sorry", "as an ai", "i don't", "i am unable"
+    ]):
+        raise HTTPException(status_code=502, detail=f"Bad response: {answer_text}")
 
-    letter = letter_match.group(1)
-    answer_text = options.get(letter, "")
-    return {"letter": letter, "answer": answer_text}
+    return {"answer": answer_text}
